@@ -104,6 +104,59 @@ class ReturnServiceImplTest {
                 .findFirst().orElseThrow();
     }
 
+    private Shipment pendingRtoOriginal() {
+        Shipment s = original(CustomerType.B2C, null);
+        s.setRtoRequestedAt(java.time.Instant.now());   // intent stamped, not yet resolved, no child
+        return s;
+    }
+
+    // One-scan RTO at the origin hub: a pending same-city intent mints a SAME_CITY child (return origin =
+    // original origin) and drives both the arrival and the RTO_INITIATED transitions.
+    @Test
+    void resolveOnHubArrival_originHub_mintsSameCityChild() {
+        Shipment original = pendingRtoOriginal();
+        when(shipmentRepo.findById(originalId)).thenReturn(Optional.of(original));
+        when(shipmentRepo.findByIdWithLock(originalId)).thenReturn(Optional.of(original));
+        when(shipmentRepo.findByReturnOfShipmentId(originalId)).thenReturn(Optional.empty());
+
+        Optional<ReturnService.ReturnResult> result =
+                service.resolveOnHubArrival(originalId, ShipmentState.AT_ORIGIN_HUB, ctx);
+
+        assertThat(result).isPresent();
+        verify(stateMachine).transition(originalId, ShipmentState.AT_ORIGIN_HUB, ctx);
+        verify(stateMachine).transition(originalId, ShipmentState.RTO_INITIATED, ctx);
+        assertThat(capturedChild().getOriginCity()).isEqualTo("DEL"); // same-city: return origin = origin
+    }
+
+    // One-scan RTO at the dest hub: a pending intent mints a REVERSE child (return origin = original dest).
+    @Test
+    void resolveOnHubArrival_destHub_mintsReverseChild() {
+        Shipment original = pendingRtoOriginal();
+        when(shipmentRepo.findById(originalId)).thenReturn(Optional.of(original));
+        when(shipmentRepo.findByIdWithLock(originalId)).thenReturn(Optional.of(original));
+        when(shipmentRepo.findByReturnOfShipmentId(originalId)).thenReturn(Optional.empty());
+
+        Optional<ReturnService.ReturnResult> result =
+                service.resolveOnHubArrival(originalId, ShipmentState.AT_DEST_HUB, ctx);
+
+        assertThat(result).isPresent();
+        verify(stateMachine).transition(originalId, ShipmentState.AT_DEST_HUB, ctx);
+        assertThat(capturedChild().getOriginCity()).isEqualTo("BOM"); // reverse: return origin = dest
+    }
+
+    // No pending RTO → no-op: empty result, no arrival transition, no child minted.
+    @Test
+    void resolveOnHubArrival_noPendingIntent_returnsEmpty() {
+        Shipment original = original(CustomerType.B2C, null); // no rtoRequestedAt
+        when(shipmentRepo.findById(originalId)).thenReturn(Optional.of(original));
+
+        Optional<ReturnService.ReturnResult> result =
+                service.resolveOnHubArrival(originalId, ShipmentState.AT_ORIGIN_HUB, ctx);
+
+        assertThat(result).isEmpty();
+        verify(stateMachine, never()).transition(any(), any(), any());
+    }
+
     @Test
     void mintsAReversedChildUnderTheSameOrder() {
         when(shipmentRepo.findByIdWithLock(originalId)).thenReturn(Optional.of(original(CustomerType.B2C, null)));

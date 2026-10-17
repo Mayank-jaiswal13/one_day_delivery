@@ -32,6 +32,7 @@ import org.springframework.web.server.ResponseStatusException;
 import org.springframework.http.HttpStatus;
 
 import java.time.Instant;
+import java.util.Optional;
 import java.util.UUID;
 
 /**
@@ -199,6 +200,42 @@ class ReturnServiceImpl implements ReturnService {
                 .log();
 
         return new ReturnResult(child.getId(), child.getShipmentRef(), originalShipmentId);
+    }
+
+    @Override
+    @Transactional
+    public Optional<ReturnResult> resolveOnHubArrival(UUID shipmentId, ShipmentState arrivalHubState,
+                                                      TransitionContext ctx) {
+        Shipment s = shipmentRepository.findById(shipmentId)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND,
+                        "Shipment not found: " + shipmentId));
+        // Pending RTO = intent recorded, not yet resolved, no child minted, not itself a return
+        // (mirrors ShipmentInfo.pendingRto + RtoIntentResolver's guard).
+        boolean pendingRto = s.getRtoRequestedAt() != null && s.getRtoResolvedAt() == null
+                && s.getReturnShipmentId() == null && s.getReturnOfShipmentId() == null;
+        if (!pendingRto) {
+            return Optional.empty();
+        }
+        // Drive the hub arrival first (the same edge the async scan uses) so initiateReturn's
+        // RTO_INITIATED transition is valid from the hub state, then mint the child synchronously in
+        // this one transaction — the dock scan resolves AND the caller sorts, in a single operator scan.
+        stateMachine.transition(shipmentId, arrivalHubState, ctx);
+        ReturnLane lane = laneFor(s.getRtoLane(), arrivalHubState);
+        return Optional.of(initiateReturn(shipmentId, ReturnReason.POST_CUSTODY_CANCEL, lane, ctx));
+    }
+
+    /** Stored lane wins (set at cancel time); else origin hub = same-city, dest hub = reverse. */
+    private static ReturnLane laneFor(String storedLane, ShipmentState arrivalHubState) {
+        ReturnLane fallback = arrivalHubState == ShipmentState.AT_ORIGIN_HUB
+                ? ReturnLane.SAME_CITY_FROM_ORIGIN : ReturnLane.REVERSE_FROM_DEST;
+        if (storedLane == null) {
+            return fallback;
+        }
+        try {
+            return ReturnLane.valueOf(storedLane);
+        } catch (IllegalArgumentException e) {
+            return fallback;
+        }
     }
 
     /**
