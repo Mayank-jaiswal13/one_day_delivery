@@ -206,9 +206,18 @@ class ReturnServiceImpl implements ReturnService {
     @Transactional
     public Optional<ReturnResult> resolveOnHubArrival(UUID shipmentId, ShipmentState arrivalHubState,
                                                       TransitionContext ctx) {
-        Shipment s = shipmentRepository.findById(shipmentId)
+        // Lock for the whole tx so a concurrent scan can't pass the pendingRto check twice and race the
+        // arrival transition into an illegal RTO_INITIATED → arrivalHubState.
+        Shipment s = shipmentRepository.findByIdWithLock(shipmentId)
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND,
                         "Shipment not found: " + shipmentId));
+        // A resolver / concurrent scan / cancel may have won the race between the hub's pendingRto read
+        // and this locked load. If the intent is already resolved and the child exists, hand that child
+        // back so the caller sorts it — never fail (and roll back) the whole /receive on a benign race.
+        if (s.getRtoResolvedAt() != null && s.getReturnShipmentId() != null) {
+            return shipmentRepository.findById(s.getReturnShipmentId())
+                    .map(c -> new ReturnResult(c.getId(), c.getShipmentRef(), shipmentId));
+        }
         // Pending RTO = intent recorded, not yet resolved, no child minted, not itself a return
         // (mirrors ShipmentInfo.pendingRto + RtoIntentResolver's guard).
         boolean pendingRto = s.getRtoRequestedAt() != null && s.getRtoResolvedAt() == null
@@ -216,12 +225,31 @@ class ReturnServiceImpl implements ReturnService {
         if (!pendingRto) {
             return Optional.empty();
         }
-        // Drive the hub arrival first (the same edge the async scan uses) so initiateReturn's
-        // RTO_INITIATED transition is valid from the hub state, then mint the child synchronously in
-        // this one transaction — the dock scan resolves AND the caller sorts, in a single operator scan.
-        stateMachine.transition(shipmentId, arrivalHubState, ctx);
+        // Drive the hub arrival first (through legal edges) so initiateReturn's RTO_INITIATED transition
+        // is valid from the hub state, then mint the child synchronously in this one transaction — the
+        // dock scan resolves AND the caller sorts, in a single operator scan.
+        driveToHubArrival(shipmentId, s.getState(), arrivalHubState, ctx);
         ReturnLane lane = laneFor(s.getRtoLane(), arrivalHubState);
         return Optional.of(initiateReturn(shipmentId, ReturnReason.POST_CUSTODY_CANCEL, lane, ctx));
+    }
+
+    /**
+     * Walk the parcel to its hub-arrival state over registered edges. {@code ArrivalMode.fromState} maps
+     * several states to the same hub arrival, so we must not request an illegal transition: skip when the
+     * parcel is already at {@code arrivalHubState} (e.g. a re-scan), and stage {@code LANDED} through
+     * {@code DISPATCHED_TO_HUB} (there is no direct LANDED → AT_DEST_HUB edge). Every other accepted source
+     * (HANDED_TO_PICKUP_VAN / RETURNED_TO_HUB / AWAITING_SELF_DROP → AT_ORIGIN_HUB; DISPATCHED_TO_HUB /
+     * COLLECTED_FROM_HUB / DROP_COLLECTED → AT_DEST_HUB) has a direct edge.
+     */
+    private void driveToHubArrival(UUID shipmentId, ShipmentState current, ShipmentState arrivalHubState,
+                                   TransitionContext ctx) {
+        if (current == arrivalHubState) {
+            return;
+        }
+        if (current == ShipmentState.LANDED && arrivalHubState == ShipmentState.AT_DEST_HUB) {
+            stateMachine.transition(shipmentId, ShipmentState.DISPATCHED_TO_HUB, ctx);
+        }
+        stateMachine.transition(shipmentId, arrivalHubState, ctx);
     }
 
     /** Stored lane wins (set at cancel time); else origin hub = same-city, dest hub = reverse. */
